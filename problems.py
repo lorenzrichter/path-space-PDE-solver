@@ -8,7 +8,7 @@ from numpy import exp, log
 from scipy.linalg import expm, inv, solve_banded
 
 
-device = pt.device('cuda')
+device = pt.device('cpu')
 
 
 class LLGC():
@@ -25,6 +25,10 @@ class LLGC():
         self.B = (pt.eye(self.d) + off_diag * pt.randn(self.d, self.d)).to(device)
         self.alpha = pt.ones(self.d, 1).to(device)
         self.X_0 = pt.zeros(self.d).to(device)
+        self.boundary = 'square'
+        self.one_boundary = False
+        self.X_l = -2.0
+        self.X_r = 2.0
 
         if ~np.all(np.linalg.eigvals(self.A.cpu().numpy()) < 0):
             print('not all EV of A are negative')
@@ -39,7 +43,7 @@ class LLGC():
         return pt.zeros(x.shape[0]).to(device)
 
     def h(self, t, x, y, z):
-        return 0.5 * pt.sum(z**2, dim=1)
+        return -0.5 * pt.sum(z**2, dim=1)
 
     def g(self, x):
         return pt.mm(x, self.alpha)[:, 0]
@@ -53,10 +57,10 @@ class LLGC():
         N = int(np.floor((self.T - t) / delta_t)) + 1
         Sigma_n = np.zeros([self.d, self.d])
         for t_n in np.linspace(t, self.T, N):
-            Sigma_n += (expm(self.A.cpu().numpy() * t_n)
+            Sigma_n += (expm(self.A.cpu().numpy() * (self.T - t_n))
                         .dot(self.sigma(np.zeros([self.d, self.d])).cpu())
                         .dot(self.sigma(np.zeros([self.d, self.d])).t().cpu())
-                        .dot(expm(self.A.cpu().numpy().T * t_n))) * delta_t
+                        .dot(expm(self.A.cpu().numpy().T * (self.T - t_n)))) * delta_t
         return ((expm(self.A.cpu().numpy() * (self.T - t)).dot(x.t()).T).dot(self.alpha.cpu().numpy())
                 - 0.5 * self.alpha.cpu().numpy().T.dot(Sigma_n.dot(self.alpha.cpu())))
 
@@ -88,7 +92,7 @@ class LLGC_general_f():
         return pt.zeros(x.shape[0])
 
     def h(self, t, x, y, z):
-        return (0.8 * ((- z)**2)**(0.625) + x * pt.exp(self.T - t) - 0.8 * pt.exp(1.25 * (self.T - t)))[:, 0]
+        return -(0.8 * ((- z)**2)**(0.625) + x * pt.exp(self.T - t) - 0.8 * pt.exp(1.25 * (self.T - t)))[:, 0]
 
     def g(self, x):
         return pt.mm(x, self.alpha)[:, 0]
@@ -159,7 +163,7 @@ class LQGC():
         return pt.sum(x.t() * pt.mm(self.R, x.t()), 0)
 
     def h(self, t, x, y, z):
-        return 0.5 * pt.sum(z**2, dim=1) - self.f(x, t)
+        return -0.5 * pt.sum(z**2, dim=1) - self.f(x, t)
 
     def u_true(self, x, t):
         n = int(np.ceil(t / self.delta_t))
@@ -203,7 +207,7 @@ class DoubleWell():
         return pt.zeros(x.shape[0]).to(device)
 
     def h(self, t, x, y, z):
-        return 0.5 * pt.sum(z**2, dim=1)
+        return -0.5 * pt.sum(z**2, dim=1)
 
     def g(self, x):
         return (self.eta * (x - 1)**2).squeeze()
@@ -313,7 +317,7 @@ class DoubleWell_multidim():
         return self.B # self.B.repeat(x.shape[0], 1, 1)
 
     def h(self, t, x, y, z):
-        return 0.5 * pt.sum(z**2, dim=1)
+        return -0.5 * pt.sum(z**2, dim=1)
 
     def f(self, x, t):
         return pt.zeros(x.shape[0]).to(device)
@@ -495,7 +499,7 @@ class DoubleWell_multidim_2():
         return self.B # self.B.repeat(x.shape[0], 1, 1)
 
     def h(self, t, x, y, z):
-        return 0.5 * pt.sum(z**2, dim=1)
+        return -0.5 * pt.sum(z**2, dim=1)
 
     def f(self, x, t):
         return pt.zeros(x.shape[0]).to(device)
@@ -537,7 +541,7 @@ class DoubleWell_multidim_3():
         return pt.zeros(x.shape[0]).to(device)
 
     def h(self, t, x, y, z):
-        return 0.5 * pt.sum(z**2, dim=1)
+        return -0.5 * pt.sum(z**2, dim=1)
 
     def g_1(self, x_1):
         return self.eta * (x_1 - 1)**2
@@ -655,7 +659,7 @@ class DoubleWell_OU():
         return pt.zeros(x.shape[0]).to(device)
 
     def h(self, t, x, y, z):
-        return 0.5 * pt.sum(z**2, dim=1)
+        return -0.5 * pt.sum(z**2, dim=1)
 
     def g_1(self, x_1):
         return self.alpha * (x_1 - 1)**2
@@ -740,3 +744,688 @@ class DoubleWell_OU():
     def u_true(self, x, t):
         u_OU = -np.exp(self.a * (t - self.T)) * np.ones(x[:, 1:].shape) * self.gamma.cpu().numpy().T
         return np.concatenate([self.u_true_1(x[:, 0], t).T, u_OU], 1).T
+
+
+class ExponentialOnSphere():
+    def __init__(self, name='Exponential on sphere', d=2, alpha=1.0):
+        self.name = name
+        self.d = d
+        self.alpha = alpha
+        self.B = (pt.sqrt(pt.tensor(2.0)) * pt.eye(self.d)).to(device)
+        self.X_0 = pt.zeros(self.d).to(device)
+        self.Y_0 = pt.zeros(1).to(device)
+        self.boundary = 'sphere'
+        self.boundary_distance = 1.0
+
+    def b(self, x):
+        return pt.zeros(x.shape).to(device)
+
+    def sigma(self, x):
+        return self.B
+   
+    def f(self, x, t):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def g(self, x):
+        return pt.exp(self.alpha * pt.sum(x**2, 1))
+
+    def h(self, x, y, z):
+        return -self.alpha * y * (self.alpha * 4 * pt.sum(x**2, 1) + 2 * self.d)
+   
+    def u_true(self, x):
+        return -2 * pt.sqrt(pt.tensor(2.0)) * self.alpha * x * pt.exp(self.alpha * pt.sum(x**2, 1).unsqueeze(1)) 
+   
+    def v_true(self, x):
+        return pt.exp(self.alpha * pt.sum(x**2, 1)) 
+
+
+class ExponentialOnBallNonlinear():
+    def __init__(self, name='Exponential on ball nonlinear', d=2, alpha=1.0, boundary_type='Dirichlet'):
+        self.name = name
+        self.d = d
+        self.alpha = alpha
+        self.B = (pt.sqrt(pt.tensor(2.0)) * pt.eye(self.d)).to(device)
+        self.X_0 = pt.zeros(self.d).to(device)
+        self.Y_0 = pt.zeros(1).to(device)
+        self.boundary = 'sphere'
+        self.boundary_distance = 1.0
+        self.boundary_type = boundary_type
+
+    def b(self, x):
+        return pt.zeros(x.shape).to(device)
+
+    def sigma(self, x):
+        return self.B
+
+    def f(self, x, t):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def g(self, x):
+        if self.boundary_type == 'Neumann':
+            return 2 * self.alpha * x * pt.exp(self.alpha * pt.sum(x**2, 1)).unsqueeze(1)
+        return pt.exp(self.alpha * pt.sum(x**2, 1))
+
+    def h(self, x, y, z):
+        return -2 * self.alpha * y * (self.alpha * 2 * pt.sum(x**2, 1) + self.d) + pt.exp(2 * self.alpha * pt.sum(x**2, 1)) - y**2
+   
+    def u_true(self, x):
+        return -2 * pt.sqrt(pt.tensor(2.0)) * self.alpha * x * pt.exp(self.alpha * pt.sum(x**2, 1).unsqueeze(1)) 
+   
+    def v_true(self, x):
+        return pt.exp(self.alpha * pt.sum(x**2, 1)) 
+
+
+class ExponentialOnBallNonlinearSin():
+    def __init__(self, name='Exponential on ball nonlinear', d=2, alpha=1.0, boundary_type='Dirichlet'):
+        self.name = name
+        self.d = d
+        self.alpha = alpha
+        self.B = (pt.sqrt(pt.tensor(2.0)) * pt.eye(self.d)).to(device)
+        self.X_0 = pt.zeros(self.d).to(device)
+        self.Y_0 = pt.zeros(1).to(device)
+        self.boundary = 'sphere'
+        self.boundary_distance = 1.0
+        self.boundary_type = boundary_type
+
+    def b(self, x):
+        return pt.zeros(x.shape).to(device)
+
+    def sigma(self, x):
+        return self.B
+
+    def f(self, x, t):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def g(self, x):
+        if self.boundary_type == 'Neumann':
+            return 2 * self.alpha * x * pt.exp(self.alpha * pt.sum(x**2, 1)).unsqueeze(1)
+        return pt.exp(self.alpha * pt.sum(x**2, 1))
+
+    def h(self, x, y, z):
+        return -2 * self.alpha * y * (self.alpha * 2 * pt.sum(x**2, 1) + self.d) + pt.sin(pt.exp(2 * self.alpha * pt.sum(x**2, 1))) - pt.sin(y**2)
+   
+    def u_true(self, x):
+        return -2 * pt.sqrt(pt.tensor(2.0)) * self.alpha * x * pt.exp(self.alpha * pt.sum(x**2, 1).unsqueeze(1)) 
+   
+    def v_true(self, x):
+        return pt.exp(self.alpha * pt.sum(x**2, 1)) 
+
+
+class ExponentialOnSphereParabolic():
+    def __init__(self, name='Exponential on sphere', d=2, T=1.0, alpha=1.0):
+        self.name = name
+        self.d = d
+        self.T = T
+        self.alpha = alpha
+        self.B = (pt.sqrt(pt.tensor(2.0)) * pt.eye(self.d)).to(device)
+        self.X_0 = pt.zeros(self.d).to(device)
+        self.Y_0 = pt.zeros(1).to(device)
+        self.boundary = 'sphere'
+        self.boundary_distance = 1.0
+
+    def b(self, x):
+        return pt.zeros(x.shape).to(device)
+
+    def sigma(self, x):
+        return self.B
+   
+    def f(self, x):
+        return pt.exp(self.alpha * pt.sum(x**2, 1) + self.T)
+
+    def g(self, x, t):
+        return pt.exp(self.alpha * pt.sum(x**2, 1) + t)
+
+    def h(self, t, x, y, z):
+        return -y * (2 * self.alpha * (self.alpha * 2 * pt.sum(x**2, 1) + self.d) + 1)
+   
+    def u_true(self, x):
+        return -2 * pt.sqrt(pt.tensor(2.0)) * self.alpha * x * pt.exp(self.alpha * pt.sum(x**2, 1).unsqueeze(1)) 
+   
+    def v_true(self, x, t):
+        return pt.exp(self.alpha * pt.sum(x**2, 1) + t) 
+
+
+class ExponentialOnSphereNonlinearParabolic():
+    def __init__(self, name='Exponential on ball', d=2, T=1.0, alpha=1.0):
+        self.name = name
+        self.d = d
+        self.T = T
+        self.alpha = alpha
+        self.B = (pt.sqrt(pt.tensor(2.0)) * pt.eye(self.d)).to(device)
+        self.X_0 = pt.zeros(self.d).to(device)
+        self.Y_0 = pt.zeros(1).to(device)
+        self.boundary = 'sphere'
+        self.boundary_distance = 1.0
+
+    def b(self, x):
+        return pt.zeros(x.shape).to(device)
+
+    def sigma(self, x):
+        return self.B
+   
+    def f(self, x):
+        return pt.exp(self.alpha * pt.sum(x**2, 1) + self.T)
+
+    def g(self, x, t):
+        return pt.exp(self.alpha * pt.sum(x**2, 1) + t)
+
+    def h(self, t, x, y, z):
+        return -y * (2 * self.alpha * (self.alpha * 2 * pt.sum(x**2, 1) + self.d) + 1) + pt.exp(2 * self.alpha * pt.sum(x**2, 1)) - y**2
+   
+    def u_true(self, x):
+        return -2 * pt.sqrt(pt.tensor(2.0)) * self.alpha * x * pt.exp(self.alpha * pt.sum(x**2, 1).unsqueeze(1)) 
+   
+    def v_true(self, x, t):
+        return pt.exp(self.alpha * pt.sum(x**2, 1) + t) 
+    
+    
+class AllenKahn():
+    def __init__(self, name='CosExp', d=1, T=0.3, seed=42, modus='np'):
+
+        np.random.seed(seed)
+        self.modus = modus
+        self.name = name
+        self.d = d
+        self.T = T
+        self.B = np.eye(self.d) * np.sqrt(2)
+        self.B_pt = pt.tensor(self.B).float().to(device)
+        self.alpha = np.ones([self.d, 1]) # not needed, can delete?
+        self.alpha_pt = pt.tensor(self.alpha).float().to(device) # not needed, can delete?
+        self.X_0 = np.zeros(self.d)
+        self.sigma_modus = 'constant'
+        self.boundary = 'unbounded'
+        self.boundary_distance = 2.0
+
+    def b(self, x):
+        if self.modus == 'pt':
+            return pt.zeros(x.shape).to(device)
+        # return 0
+        return np.zeros(x.shape)
+
+    def sigma(self, x):
+        if self.modus == 'pt':
+            return self.B_pt
+        return self.B
+
+    def h(self, t, x, y, z):
+        return y - y**3
+
+    def f(self, x):
+        if self.modus == 'pt':
+            return 1 / (2 + 2 / 5 * pt.sum(x**2, 1))
+        return 1 / (2 + 2 / 5 * np.linalg.norm(x, axis=1)**2)
+
+    def u_true(self, x, t):
+        print('no reference solution known')
+        return 0
+
+    def v_true(self, x, t):
+        print('no reference solution known')
+        return 0
+
+
+
+class DoubleWell_stopping():
+    def __init__(self, name='Double well', d=1, beta=1):
+        self.name = name
+        self.d = d
+        self.beta = beta
+        self.B = pt.eye(self.d).to(device)
+        self.X_0 = -pt.ones(self.d).to(device)
+        self.Y_0 = -pt.zeros(self.d).to(device)
+        self.boundary = 'square'
+        self.one_boundary = True
+        self.X_l = -2.0
+        self.X_r = 1.0
+
+        if self.d != 1:
+            print('The double well example is only implemented for d = 1.')
+           
+    def compute_reference_solution(self):
+        # discretization of the state space
+
+        f = 1
+        sigma = self.B[0, 0].cpu().numpy()
+        self.xr = [-2, 2]
+        self.dx = 0.01
+        Nx = int(np.ceil((self.xr[1] - self.xr[0]) / self.dx))
+        x_val = np.linspace(self.xr[0], self.xr[1], Nx)
+
+        # discretization of the generator
+
+        L = np.zeros([Nx, Nx])
+
+        L[0, 0] = - 2 * sigma**2 / 2 / self.dx**2 - self.grad_V(x_val[0]) / self.dx - f
+        L[0, 1] = sigma**2 / self.dx
+        L[Nx - 1, Nx - 2] = sigma**2 / 2 / self.dx**2 + self.grad_V(x_val[Nx - 1]) / self.dx
+        L[Nx - 1, Nx - 1] = - sigma**2 / self.dx**2 - sigma * self.grad_V(x_val[Nx - 1]) / self.dx - f
+
+        for i in range(1, Nx - 1):
+            L[i, i - 1] = sigma**2 / 2 / self.dx**2 + self.grad_V(x_val[i]) / self.dx
+            L[i, i] = - sigma**2 / self.dx**2 - self.grad_V(x_val[i]) / self.dx - f
+            L[i, i + 1] = sigma**2 / 2 / self.dx**2
+
+        d = np.zeros(Nx)
+
+        # boundary condition, apply it for multiple values of x for numerical stability
+        L[300:310, :] = 0
+        for i in range(300, 310):
+            L[i, i] = 1
+        d[300:310] = 1 # e^{-g(x)}
+
+        # additional stability: psi shall be flat on the boundary
+        L[0, :] = 0
+        L[0, 0] = 1
+        L[0, 1] = -1
+        d[0] = 0
+
+        L[Nx - 1, :] = 0
+        L[Nx - 1, Nx - 1] = 1
+        L[Nx - 1, Nx - 2] = -1
+        d[Nx - 1] = 0
+
+        self.psi = np.linalg.solve(L, d)
+        self.u = sigma * (- np.log(self.psi[:-1]) + np.log(self.psi[1:])) / self.dx
+
+    def V(self, x):
+        return self.beta * (x**2 - 1)**2
+
+    def grad_V(self, x):
+        return 4.0 * self.beta * x * (x**2 - 1)
+
+    def b(self, x):
+        return -self.grad_V(x)
+
+    def sigma(self, x):
+        return self.B
+   
+    def f(self, x):
+        return pt.ones(x.shape[0]).to(device)
+
+    def g(self, x):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def h(self, x, y, z):
+        return -0.5 * pt.sum(z**2, dim=1) + self.f(x)
+   
+    def u_true(self, x, t):
+        i = pt.clamp(np.floor((x.squeeze(0) + self.xr[1]) / self.dx).long(), 0, 298).view(-1)
+        return np.array(self.u[i]).reshape([1, len(i)])
+   
+    def v_true(self, x):
+        i = pt.clamp(pt.floor((x.squeeze() + self.xr[1]) / self.dx).long(), 0, 298).view(-1)
+        return np.array(-np.log(self.psi)[i]).reshape([1, len(i)])
+
+
+class DoubleWell_stopping_linear():
+    def __init__(self, name='Double well', d=1, beta=1):
+        self.name = name
+        self.d = d
+        self.beta = beta
+        self.B = pt.eye(self.d).to(device)
+        self.X_0 = -pt.ones(self.d).to(device)
+        self.Y_0 = -pt.zeros(self.d).to(device)
+        self.boundary = 'square'
+        self.one_boundary = True
+        self.X_l = -2.0
+        self.X_r = 1.0
+
+        if self.d != 1:
+            print('The double well example is only implemented for d = 1.')
+           
+    def compute_reference_solution(self):
+        # discretization of the state space
+
+        f = 1
+        sigma = self.B[0, 0].cpu().numpy()
+        self.xr = [-2, 2]
+        self.dx = 0.01
+        Nx = int(np.ceil((self.xr[1] - self.xr[0]) / self.dx))
+        x_val = np.linspace(self.xr[0], self.xr[1], Nx)
+
+        # discretization of the generator
+
+        L = np.zeros([Nx, Nx])
+
+        L[0, 0] = - 2 * sigma**2 / 2 / self.dx**2 - self.grad_V(x_val[0]) / self.dx - f
+        L[0, 1] = sigma**2 / self.dx
+        L[Nx - 1, Nx - 2] = sigma**2 / 2 / self.dx**2 + self.grad_V(x_val[Nx - 1]) / self.dx
+        L[Nx - 1, Nx - 1] = - sigma**2 / self.dx**2 - sigma * self.grad_V(x_val[Nx - 1]) / self.dx - f
+
+        for i in range(1, Nx - 1):
+            L[i, i - 1] = sigma**2 / 2 / self.dx**2 + self.grad_V(x_val[i]) / self.dx
+            L[i, i] = - sigma**2 / self.dx**2 - self.grad_V(x_val[i]) / self.dx - f
+            L[i, i + 1] = sigma**2 / 2 / self.dx**2
+
+        d = np.zeros(Nx)
+
+        # boundary condition, apply it for multiple values of x for numerical stability
+        L[300:310, :] = 0
+        for i in range(300, 310):
+            L[i, i] = 1
+        d[300:310] = 1 # e^{-g(x)}
+
+        # additional stability: psi shall be flat on the boundary
+        L[0, :] = 0
+        L[0, 0] = 1
+        L[0, 1] = -1
+        d[0] = 0
+
+        L[Nx - 1, :] = 0
+        L[Nx - 1, Nx - 1] = 1
+        L[Nx - 1, Nx - 2] = -1
+        d[Nx - 1] = 0
+
+        self.psi = np.linalg.solve(L, d)
+        self.u = sigma * (- np.log(self.psi[:-1]) + np.log(self.psi[1:])) / self.dx
+
+    def V(self, x):
+        return self.beta * (x**2 - 1)**2
+
+    def grad_V(self, x):
+        return 4.0 * self.beta * x * (x**2 - 1)
+
+    def b(self, x):
+        return -self.grad_V(x)
+
+    def sigma(self, x):
+        return self.B
+   
+    def f(self, x):
+        return pt.ones(x.shape[0]).to(device)
+
+    def g(self, x):
+        return pt.ones(x.shape[0]).to(device)
+
+    def h(self, x, y, z):
+        return -self.f(x) * y
+   
+    def u_true(self, x, t):
+        i = pt.clamp(np.floor((x.squeeze(0) + self.xr[1]) / self.dx).long(), 0, 298).view(-1)
+        return np.array(self.u[i]).reshape([1, len(i)])
+   
+    def v_true(self, x):
+        i = pt.clamp(np.floor((x.squeeze() + self.xr[1]) / self.dx).long(), 0, 298).view(-1)
+        return np.array(self.psi[i]).reshape([1, len(i)])
+
+
+class DoubleWell_expectation_hitting_time():
+    def __init__(self, name='Double well', d=1, beta=1):
+        self.name = name
+        self.d = d
+        self.beta = beta
+        self.B = 2 * pt.eye(self.d).to(device)
+        self.X_0 = -pt.ones(self.d).to(device)
+        self.Y_0 = -pt.zeros(self.d).to(device)
+        self.boundary = 'square'
+        self.one_boundary = True
+        self.X_l = -2.0
+        self.X_r = 1.0
+
+        if self.d != 1:
+            print('The double well example is only implemented for d = 1.')
+           
+    def compute_reference_solution(self):
+        # discretization of the state space
+
+        f = 0
+        sigma = self.B[0, 0].cpu().numpy()
+        self.xr = [-2, 2]
+        self.dx = 0.01
+        Nx = int(np.ceil((self.xr[1] - self.xr[0]) / self.dx))
+        x_val = np.linspace(self.xr[0], self.xr[1], Nx)
+
+        # discretization of the generator
+
+        L = np.zeros([Nx, Nx])
+
+        L[0, 0] = - 2 * sigma**2 / 2 / self.dx**2 - self.grad_V(x_val[0]) / self.dx - f
+        L[0, 1] = sigma**2 / self.dx
+        L[Nx - 1, Nx - 2] = sigma**2 / 2 / self.dx**2 + self.grad_V(x_val[Nx - 1]) / self.dx
+        L[Nx - 1, Nx - 1] = - sigma**2 / self.dx**2 - sigma * self.grad_V(x_val[Nx - 1]) / self.dx - f
+
+        for i in range(1, Nx - 1):
+            L[i, i - 1] = sigma**2 / 2 / self.dx**2 + self.grad_V(x_val[i]) / self.dx
+            L[i, i] = - sigma**2 / self.dx**2 - self.grad_V(x_val[i]) / self.dx - f
+            L[i, i + 1] = sigma**2 / 2 / self.dx**2
+
+        d = -np.ones(Nx)
+
+        # boundary condition, apply it for multiple values of x for numerical stability
+        L[300:330, :] = 0
+        for i in range(300, 330):
+            L[i, i] = 1
+        d[300:330] = 0 #g(x)
+
+        # additional stability: psi shall be flat on the boundary
+        L[0, :] = 0
+        L[0, 0] = 1
+        L[0, 1] = -1
+        d[0] = 0
+
+        L[Nx - 1, :] = 0
+        L[Nx - 1, Nx - 1] = 1
+        L[Nx - 1, Nx - 2] = -1
+        d[Nx - 1] = 0
+
+        self.psi = np.linalg.solve(L, d)
+        self.u = sigma * (- np.log(self.psi[:-1]) + np.log(self.psi[1:])) / self.dx
+
+    def V(self, x):
+        return self.beta * (x**2 - 1)**2
+
+    def grad_V(self, x):
+        return 4.0 * self.beta * x * (x**2 - 1)
+
+    def b(self, x):
+        return -self.grad_V(x)
+
+    def sigma(self, x):
+        return self.B
+   
+    def f(self, x):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def g(self, x):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def h(self, x, y, z):
+        return pt.ones(y.shape[0]).to(device)
+   
+    def u_true(self, x):
+        return x
+
+    def v_true(self, x):
+        i = pt.clamp(np.floor((x.squeeze() + self.xr[1]) / self.dx).long(), 0, 298).view(-1)
+        return np.array(self.psi[i]).reshape([1, len(i)])
+
+
+class Committor():
+    def __init__(self, name='Committor', d=2, alpha=1.0):
+        self.name = name
+        self.a = 1.0
+        self.c = 2.0
+        self.d = d
+        self.B = (pt.eye(self.d)).to(device)
+        self.X_0 = pt.zeros(self.d).to(device)
+        self.Y_0 = pt.zeros(1).to(device)
+        self.boundary = 'two_spheres'
+        self.boundary_distance_1 = self.a
+        self.boundary_distance_2 = self.c
+
+
+    def b(self, x):
+        return pt.zeros(x.shape).to(device)
+
+    def sigma(self, x):
+        return self.B
+   
+    def f(self, x):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def g(self, x):            
+        return (pt.sqrt(pt.sum(x**2, 1)) > self.a).float().to(device)
+
+    def h(self, x, y, z):
+        return pt.zeros(x.shape[0]).to(device)
+   
+    def u_true(self, x):
+        return pt.zeros(x.shape) 
+   
+    def v_true(self, x):
+        return ((self.a**2 - pt.sqrt(pt.sum(x**2, 1))**(2 - self.d) * self.a**self.d) 
+                 / (self.a**2 - self.c**(2 - self.d) * self.a**self.d))
+
+
+class QuadraticGradient():
+    def __init__(self, name='Quadratic Gradient', d=1, r=1.0):
+        self.name = name
+        self.d = d
+        self.B = pt.sqrt(pt.tensor(2.0)).to(device) * pt.eye(self.d).to(device)
+        self.X_0 = -pt.ones(self.d).to(device)
+        self.Y_0 = -pt.zeros(self.d).to(device)
+        self.boundary = 'sphere'
+        self.boundary_distance = r
+
+    def b(self, x):
+        return pt.zeros(x.shape).to(device)
+
+    def sigma(self, x):
+        return self.B
+   
+    def f(self, x):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def g(self, x):
+        return pt.log((pt.sum(x**2, 1) + 1) / self.d)
+
+    def h(self, x, y, z):
+        return pt.sum(z**2, dim=1) / self.B[0, 0]**2 - 2 * pt.exp(-y)
+   
+    def u_true(self, x, t):
+        return pt.zeros(x.shape[0], 1).to(device)
+   
+    def v_true(self, x):
+        return pt.log((pt.sum(x**2, 1) + 1) / self.d)
+
+
+
+class Helmholtz():
+    def __init__(self, name='Helmholtz', d=2, r=1.0):
+        self.name = name
+        self.d = d
+        self.B = pt.sqrt(pt.tensor(2.0)).to(device) * pt.eye(self.d).to(device)
+        self.X_0 = -pt.ones(self.d).to(device)
+        self.Y_0 = -pt.zeros(self.d).to(device)
+        self.a_1 = 1.0
+        self.a_2 = 4.0
+        self.k = 1.0
+        self.pi = pt.tensor(np.pi)
+        self.boundary = 'square'
+        self.one_boundary = False
+        self.X_l = -1.0
+        self.X_r = 1.0
+
+        if d != 2:
+            print('Only implemented for d = 2.')
+
+    def b(self, x):
+        return pt.zeros(x.shape).to(device)
+
+    def sigma(self, x):
+        return self.B
+   
+    def f(self, x):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def g(self, x):
+        return pt.sin(self.a_1 * self.pi * x[:, 0]) * pt.sin(self.a_2 * self.pi * x[:, 1])
+
+    def h(self, x, y, z):
+        return (self.k**2 * y + (self.a_1 * self.pi)**2 * pt.sin(self.a_1 * self.pi * x[:, 0]) * pt.sin(self.a_2 * self.pi * x[:, 1])
+            + (self.a_2 * self.pi)**2 * pt.sin(self.a_1 * self.pi * x[:, 0]) * pt.sin(self.a_2 * self.pi * x[:, 1]) 
+            - self.k**2 * pt.sin(self.a_1 * self.pi * x[:, 0]) * pt.sin(self.a_2 * self.pi * x[:, 1]))
+   
+    def u_true(self, x, t):
+        return pt.zeros(x.shape[0], 1).to(device)
+   
+    def v_true(self, x):
+        return pt.sin(self.a_1 * self.pi * x[:, 0]) * pt.sin(self.a_2 * self.pi * x[:, 1])
+
+
+
+
+class Oscillations():
+    def __init__(self, name='Oscillations', d=1, r=1.0):
+        self.name = name
+        self.d = d
+        self.B = pt.sqrt(pt.tensor(2.0)).to(device) * pt.eye(self.d).to(device)
+        self.X_0 = -pt.ones(self.d).to(device)
+        self.Y_0 = -pt.zeros(self.d).to(device)
+        self.pi = pt.tensor(np.pi)
+        self.a = 5
+        self.boundary = 'square'
+        self.one_boundary = False
+        self.X_l = 0.0
+        self.X_r = 1.0
+
+        if d != 1:
+            print('Only implemented for d = 1.')
+
+    def b(self, x):
+        return pt.zeros(x.shape).to(device)
+
+    def sigma(self, x):
+        return self.B
+   
+    def f(self, x):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def g(self, x):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def h(self, x, y, z):
+        return (2 * self.pi)**2 * pt.sin(2 * self.pi * x[:, 0]) + (self.a * self.pi)**2 * 0.1 * pt.sin(self.a * self.pi * x[:, 0])
+   
+    def u_true(self, x, t):
+        return pt.zeros(x.shape[0], 1).to(device)
+   
+    def v_true(self, x):
+        return pt.sin(2 * self.pi * x[:, 0]) + 0.1 * pt.sin(self.a * self.pi * x[:, 0])
+
+
+
+class SinNorm2():
+    def __init__(self, name='SinNorm2', d=1, r=1.0, linear=True):
+        self.name = name
+        self.d = d
+        self.B = pt.sqrt(pt.tensor(2.0) / self.d).to(device) * pt.ones(self.d, self.d).to(device)
+        self.X_0 = -pt.ones(self.d).to(device)
+        self.Y_0 = -pt.zeros(self.d).to(device)
+        self.pi = pt.tensor(np.pi)
+        self.linear = linear
+        self.boundary = 'sphere'
+        self.boundary_distance = 1.0
+
+    def b(self, x):
+        return pt.zeros(x.shape).to(device)
+
+    def sigma(self, x):
+        return self.B
+   
+    def f(self, x):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def g(self, x):
+        return pt.zeros(x.shape[0]).to(device)
+
+    def h(self, x, y, z):
+        if self.linear:
+            return 4 * self.pi**2 * pt.sin(self.pi * pt.sum(x**2, 1)) * pt.sum(x, 1)**2 - 2 * self.d * self.pi * pt.cos(self.pi * pt.sum(x**2, 1))
+        return 4 * self.pi**2 * y * pt.sum(x, 1)**2 - 2 * self.d * self.pi * pt.cos(self.pi * pt.sum(x**2, 1))
+   
+    def u_true(self, x, t):
+        return pt.zeros(x.shape[0], 1).to(device)
+   
+    def v_true(self, x):
+        return pt.sin(self.pi * pt.sum(x**2, 1))

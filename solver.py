@@ -3,6 +3,7 @@
 #pylint: disable=inconsistent-return-statements, too-many-locals, too-many-return-statements
 #pylint: disable=too-many-statements, too-many-public-methods
 
+from copy import deepcopy
 from datetime import date
 import json
 import numpy as np
@@ -11,7 +12,7 @@ import time
 import torch as pt
 
 from function_space import DenseNet, Linear, NN, NN_Nik, SingleParam, MySequential
-from utilities import do_importance_sampling, do_importance_sampling_me
+from utilities import compute_test_error, do_importance_sampling, do_importance_sampling_me
 
 
 class Solver():
@@ -21,7 +22,7 @@ class Solver():
                  learn_Y_0=False, adaptive_forward_process=True, detach_forward=False,
                  early_stopping_time=10000, random_X_0=False, compute_gradient_variance=0,
                  IS_variance_K=0, IS_variance_iter=1, metastability_logs=None, print_every=100, plot_trajectories=None,
-                 seed=42, save_results=False, u_l2_error_flag=True, log_gradient=False, verbose=True):
+                 seed=42, save_results=False, u_l2_error_flag=True, log_gradient=False, burgers_drift=False, verbose=True):
         self.problem = problem
         self.name = name
         self.date = date.today().strftime('%Y-%m-%d')
@@ -32,7 +33,7 @@ class Solver():
         self.X_u_opt = None
 
         # hyperparameters
-        self.device = pt.device('cuda')
+        self.device = pt.device('cpu')
         self.seed = seed
         self.delta_t_np = delta_t
         self.delta_t = pt.tensor(self.delta_t_np).to(self.device) # step size
@@ -50,6 +51,7 @@ class Solver():
         self.adaptive_forward_process = adaptive_forward_process
         self.detach_forward = detach_forward
         self.early_stopping_time = early_stopping_time
+        self.burgers_drift = burgers_drift
 
         self.has_ref_solution = hasattr(problem, 'u_true')
         self.u_l2_error_flag = u_l2_error_flag
@@ -164,6 +166,8 @@ class Solver():
             return (Y - self.g(X)).pow(2).mean()
         elif self.loss_method == 'log-variance':
             return (Y - self.g(X)).pow(2).mean() - (Y - self.g(X)).mean().pow(2)
+        elif self.loss_method == 'log-variance-repa':
+            return (l % 2 * 2 - 1) * ((Y - self.g(X)).pow(2).mean() - (Y - self.g(X)).mean().pow(2))
         elif self.loss_method == 'variance':
             return pt.var(pt.exp(- self.g(X) + Y))
         elif self.loss_method == 'log-variance_red':
@@ -184,6 +188,8 @@ class Solver():
             if l < 1000:
                 return ((Z_sum + self.g(X))).mean()
             return (Y - self.g(X)).pow(2).mean() - (Y - self.g(X)).mean().pow(2)
+        elif self.loss_method == 'reparametrization':
+            return (Z_sum + self.g(X)).mean()
 
     def zero_grad(self):
         for phi in self.Phis:
@@ -195,6 +201,22 @@ class Solver():
 
     def gradient_descent(self, X, Y, Z_sum, l, additional_loss):
         self.zero_grad()
+
+        if self.loss_method == 'log-variance-y_0':
+
+            loss_1 = pt.var(Y - self.g(X))
+            loss_1.backward(retain_graph=True)
+            self.z_n.optim.step()
+
+            if self.learn_Y_0 is True:
+                loss_2 = pt.mean(Y - self.g(X))**2
+                loss_2.backward(retain_graph=True)
+                self.y_0.optim.step()
+            else:
+                loss_2 = 0
+
+            return loss_1 + loss_2
+
         loss = self.loss_function(X, Y, Z_sum, l) + additional_loss
         loss.backward()
         self.optimization_step()
@@ -377,7 +399,7 @@ class Solver():
                 loss += pt.sum((- self.Z_n_(X, n) - pt.tensor(self.u_true(X, n * self.delta_t_np)).float())**2) * self.delta_t
             self.zero_grad()
             loss.backward()
-            self.gradient_descent()
+            self.optimization_step()
 
             self.loss_log.append(loss.item())
 
@@ -387,14 +409,13 @@ class Solver():
             if l % self.print_every == 0:
                 string = ('%d - loss: %.3e - time/iter: %.2fs' % (l, self.loss_log[-1],
                           np.mean(self.times[-self.print_every:])))
-                print(string)
-                print('gradient l_inf: %.3e\n' %
+                print(string + ' - gradient l_inf: %.3e' %
                       (np.array([max([pt.norm(params.grad.data, float('inf')).item() for params
                                       in filter(lambda params: params.requires_grad,
                                                 phi.parameters())])
                                  for phi in self.Phis]).max()))
 
-        self.save_networks()
+        #   self.save_networks()
 
     def train(self):
 
@@ -412,21 +433,53 @@ class Solver():
             X, Y, Z_sum, u_L2, u_int, u_W_int, double_int, xi = self.initialize_training_data()
             additional_loss = pt.zeros(self.K)
 
+
+            if self.loss_method == 'reparametrization':
+                z_n_copy = deepcopy(self.z_n)
+
             for n in range(self.N):
                 if self.approx_method == 'value_function':
                     if n > 0:
                         additional_loss += (self.Y_n(X, n)[:, 0] - Y).pow(2)
-                Z = self.Z_n_(X, n)
+                if self.loss_method == 'log-variance-repa' and l % 2 == 0:
+                    z_n_copy = deepcopy(self.z_n)
+                    t_X = pt.cat([pt.ones([X.shape[0], 1]).to(self.device) * n * self.delta_t, X], 1)
+                    Z = z_n_copy(t_X)
+                else:
+                    Z = self.Z_n_(X, n)
 
                 c = pt.zeros(self.d, self.K).to(self.device)
                 if self.adaptive_forward_process is True:
-                    c = -Z.t()
-                if self.detach_forward is True:
+                    if self.burgers_drift is True:
+                        c = pt.ones(self.d, self.K).to(self.device) * (Y.unsqueeze(0) - (2 + self.d) / (2 * self.d))
+                    else:
+                        c = -self.Z_n_(X, n).t()
+                        #c = -Z.t()
+
+                if self.loss_method == 'reparametrization':
+                    if self.time_approx == 'outer':
+                        n = max(0, min(n, self.N - 1))
+                        z_n_copy = deepcopy(self.z_n[n])
+                        v = -z_n_copy(X)
+                    else:
+                        t_X = pt.cat([pt.ones([X.shape[0], 1]).to(self.device) * n * self.delta_t, X], 1)
+                        v = -z_n_copy(t_X)
+
+                if self.detach_forward is True or (self.loss_method == 'log-variance-repa' and l % 2 == 1):
                     c = c.detach()
+
                 X = (X + (self.b(X) + pt.mm(self.sigma(X), c).t()) * self.delta_t
                      + pt.mm(self.sigma(X), xi[:, :, n + 1].t()).t() * self.sq_delta_t)
-                Y = (Y + (self.h(self.delta_t * n, X, Y, Z) + pt.sum(Z * c.t(), 1)) * self.delta_t
+
+                #X = (X + (self.b(X) + pt.bmm(self.sigma(X), c.t().unsqueeze(2)).squeeze(2)) * self.delta_t 
+                #     + pt.bmm(self.sigma(X), xi[:, :, n + 1].unsqueeze(2)).squeeze(2) * self.sq_delta_t)
+
+                Y = (Y + (-self.h(self.delta_t * n, X, Y, Z) + pt.sum(Z * c.t(), 1)) * self.delta_t
                      + pt.sum(Z * xi[:, :, n + 1], 1) * self.sq_delta_t)
+
+                if self.loss_method == 'reparametrization':
+                    Z_sum += (-0.5 * pt.sum(v**2, 1) * self.delta_t + pt.sum(v * c.t(), 1) * self.delta_t
+                              + pt.sum(v * xi[:, :, n + 1], 1) * self.sq_delta_t)
 
                 if 'relative_entropy' in self.loss_method:
                     #Z_sum += 0.5 * pt.sum((-Z)**2, 1) * self.delta_t
@@ -482,6 +535,8 @@ class Solver():
                     string = ('%d - loss: %.4e - u L2: %.4e - time/iter: %.2fs'
                               % (l, self.loss_log[-1], self.u_L2_loss[-1],
                                  np.mean(self.times[-self.print_every:])))
+                    if self.learn_Y_0 is True:
+                            string += ' - Y_0: %.4e' % self.Y_0_log[-1]
                     if self.IS_variance_K > 0:
                         string += ' - rel IS: %.3e' % rel_IS
                     print(string)
@@ -500,3 +555,533 @@ class Solver():
 
         if self.save_results is True:
             self.save_logs()
+
+
+class EllipticSolver():
+    
+    def __init__(self, problem, name, seed=42, delta_t=0.01, N=50, lr=0.001, L=100000, K=200, K_boundary=50,
+                 alpha=[1.0, 1.0], adaptive_forward_process=False, detach_forward=True, print_every=100, verbose=True, 
+                 approx_method='Y', sample_center=False, loss_method='ito', loss_with_stopped=False, K_test_log=None,
+                 PINN_log_variance=False, log_loss_parts=False, boundary_loss=True, boundary_type='Dirichlet'):
+        self.problem = problem
+        self.name = name
+        self.date = date.today().strftime('%Y-%m-%d')
+        self.d = problem.d
+
+        # hyperparameters
+        self.device = pt.device('cpu')
+        self.seed = seed
+        self.delta_t_np = delta_t
+        self.delta_t = pt.tensor(self.delta_t_np).to(self.device) # step size
+        self.sq_delta_t = pt.sqrt(self.delta_t).to(self.device)
+        self.N = N
+        self.lr = lr # learning rate
+        self.L = L # gradient steps
+        self.K = K # batch size in domain
+        self.K_boundary = K_boundary # batch size on boundary
+        self.alpha = alpha
+        self.boundary_type = boundary_type
+
+        # learning properties
+        self.adaptive_forward_process = adaptive_forward_process
+        self.detach_forward = detach_forward
+        self.approx_method = approx_method
+        self.sample_center = sample_center
+        self.loss_method = loss_method
+        self.loss_with_stopped = loss_with_stopped
+        self.boundary_loss = boundary_loss
+        self.PINN_log_variance = PINN_log_variance
+
+        # printing and logging
+        self.print_every = print_every
+        self.verbose = verbose
+
+        # function approximation
+        pt.manual_seed(seed)
+        if self.approx_method == 'Y':
+            self.V = DenseNet(d_in=self.d, d_out=1, lr=self.lr, seed=seed).to(self.device)
+        elif self.approx_method == 'Z':
+            self.y_0 = SingleParam(lr=self.lr).to(self.device)
+            self.Z = DenseNet(d_in=self.d, d_out=self.d, lr=self.lr, seed=seed).to(self.device)
+            
+        # logging
+        self.K_test_log = K_test_log
+        self.Y_0_log = []
+        self.loss_log = []
+        self.loss_log_domain = []
+        self.loss_log_boundary = []
+        self.u_L2_log = []
+        self.V_L2_log = []
+        self.V_test_log = []
+        self.times = []
+        self.lambda_log = []
+        self.log_loss_parts = log_loss_parts
+        
+    def train(self):
+    
+        pt.manual_seed(self.seed)
+
+        if self.loss_method == 'PINN':
+            self.train_PINN()
+            return None
+        
+        for l in range(self.L):
+
+            t_0 = time.time()
+
+            loss = 0
+
+            if self.sample_center:
+                X_center = pt.zeros(1, 1)
+                loss += pt.mean((self.V(X_center).squeeze() - self.problem.v_true(X_center).squeeze())**2)
+
+            # sample uniformly on boundary
+            if self.problem.boundary == 'sphere':
+                X_boundary = pt.rand(self.K_boundary, self.d).to(self.device) * 2 - 1
+                X_boundary = self.problem.boundary_distance * X_boundary / pt.sqrt(pt.sum(X_boundary**2, 1)).unsqueeze(1)
+            elif self.problem.boundary == 'two_spheres':
+                X_boundary = pt.rand(self.K_boundary, self.problem.d).to(self.device) * 2 - 1
+                X_boundary = (pt.tensor([self.problem.boundary_distance_1] * int(self.K_boundary / 2) + 
+                                        [self.problem.boundary_distance_2] * int(self.K_boundary / 2)).unsqueeze(1).to(self.device)
+                              * X_boundary / pt.sqrt(pt.sum(X_boundary**2, 1)).unsqueeze(1))
+            elif self.problem.boundary == 'square':
+                s = np.concatenate([np.ones(int(self.K_boundary / 2))[:, np.newaxis], np.zeros([int(self.K_boundary / 2), self.d - 1])], 1)
+                np.apply_along_axis(np.random.shuffle, 1, s)
+                a = np.concatenate([s, np.zeros([int(self.K_boundary / 2), self.problem.d])]).astype(bool)
+                b = np.concatenate([np.zeros([int(self.K_boundary / 2), self.problem.d]), s]).astype(bool)
+                X_boundary = (self.problem.X_r - self.problem.X_l) * pt.rand(self.K_boundary, self.problem.d).to(self.device) + self.problem.X_l
+                X_boundary[pt.tensor(a.astype(float)).byte()] = self.problem.X_l
+                X_boundary[pt.tensor(b.astype(float)).byte()] = self.problem.X_r
+                if self.problem.one_boundary:
+                    X_boundary[pt.tensor(a.astype(float)).byte()] = self.problem.X_r
+                    X_boundary[pt.tensor(b.astype(float)).byte()] = self.problem.X_r
+
+            if self.loss_method != 'L4' and self.boundary_loss:
+                if self.boundary_type == 'Dirichlet':
+                    loss += self.alpha[1] * pt.mean((self.V(X_boundary).squeeze() - self.problem.g(X_boundary))**2)
+                elif self.boundary_type == 'Neumann':
+                    X_boundary = pt.autograd.Variable(X_boundary, requires_grad=True)
+                    Y_ = self.V(X_boundary)
+                    Y_eval = Y_.squeeze().sum() # compare to Jacobi-Vector trick
+                    Y_eval.backward(retain_graph=True) # do we need this?
+                    grad_V, = pt.autograd.grad(Y_eval, X_boundary, create_graph=True) # , allow_unused=True
+                    loss += self.alpha[1] * pt.mean((pt.sum(grad_V * X_boundary, 1) - pt.sum(self.problem.g(X_boundary) * X_boundary, 1))**2)
+
+            if self.problem.boundary == 'sphere':
+                X = 2 * pt.rand(self.K, self.problem.d).to(self.device) - 1
+                X = self.problem.boundary_distance * X / pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) * (pt.rand(self.K).unsqueeze(1)).to(self.device)
+            elif self.problem.boundary == 'two_spheres':
+                X = pt.rand(self.K, self.problem.d).to(self.device) * 2 - 1
+                X = X / pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) * (pt.rand(self.K, self.problem.d).to(self.device) * (self.problem.boundary_distance_2 - self.problem.boundary_distance_1) + self.problem.boundary_distance_1)
+            elif self.problem.boundary == 'square':
+                X = (self.problem.X_r - self.problem.X_l) * pt.rand(self.K, self.problem.d).to(self.device) + self.problem.X_l
+
+            X = pt.autograd.Variable(X, requires_grad=True)
+            Y = pt.zeros(self.K).to(self.device)
+            if self.loss_method in ['jentzen', 'L4']:
+                Y = self.V(X).squeeze()
+
+            #lambda_log.append(lambda_(X)[0].item())
+            stopped = pt.zeros(self.K).byte().to(self.device)
+            hitting_times = pt.zeros(self.K)
+            V_L2 = pt.zeros(self.K)
+
+            phi_0 = self.V(X).squeeze()
+
+            for n in range(self.N):
+
+                Y_ = self.V(X)
+                Y_eval = Y_.squeeze().sum() # compare to Jacobi-Vector trick
+                Y_eval.backward(retain_graph=True) # do we need this?
+                Z, = pt.autograd.grad(Y_eval, X, create_graph=True) # , allow_unused=True
+                Z = pt.mm(self.problem.sigma(X).t(), Z.t()).t()
+
+                xi = pt.randn(self.K, self.d).to(self.device)
+
+                selection = ~stopped
+                K_selection = pt.sum(selection)
+                if K_selection == 0:
+                    break
+
+                V_L2[selection] += ((self.V(X[selection]).squeeze() - pt.tensor(self.problem.v_true(X[selection])).float().squeeze())**2).detach().cpu() * self.delta_t_np
+
+                c = pt.zeros(self.d, self.K).to(self.device)
+                if self.adaptive_forward_process is True:
+                    c = -Z.t()
+                if self.detach_forward is True:
+                    c = c.detach()
+
+                X_proposal = (X + ((self.problem.b(X) + pt.mm(self.problem.sigma(X), c).t()) * self.delta_t
+                     + pt.mm(self.problem.sigma(X), xi.t()).t() * self.sq_delta_t) * selection.float().unsqueeze(1).repeat(1, self.d))
+
+                hitting_times[selection] += 1
+                if self.problem.boundary == 'sphere':
+                    new_selection = pt.all(pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) < self.problem.boundary_distance, 1).to(self.device)
+                elif self.problem.boundary == 'two_spheres':
+                    new_selection = ((pt.sqrt(pt.sum(X**2, 1)) > self.problem.boundary_distance_1) & (pt.sqrt(pt.sum(X**2, 1)) < self.problem.boundary_distance_2)).to(self.device)
+                elif self.problem.boundary == 'square':
+                    if self.problem.one_boundary:
+                        new_selection = pt.all((X_proposal <= self.problem.X_r), 1).to(self.device)
+                    else:
+                        new_selection = pt.all((X_proposal >= self.problem.X_l) & (X_proposal <= self.problem.X_r), 1).to(self.device)
+
+                if self.loss_method == 'jentzen':
+                    loss += self.alpha[0] * pt.mean((Y_.squeeze() - Y)**2 * (new_selection & ~stopped).float())
+
+                if self.loss_method in ['jentzen', 'L4']:
+                    Y = (Y + ((- self.problem.h(X, Y, Z) #- lambda_(X) * Y_.squeeze() #  lambda_(X) 
+                               + pt.sum(Z * c.t(), 1)) * self.delta_t + pt.sum(Z * xi, 1) * self.sq_delta_t) * (new_selection & ~stopped).float())
+                else:
+                    Y = (Y + ((- self.problem.h(X, Y_.squeeze(), Z) #- lambda_(X) * Y_.squeeze() #  lambda_(X) 
+                               + pt.sum(Z * c.t(), 1)) * self.delta_t + pt.sum(Z * xi, 1) * self.sq_delta_t) * (new_selection & ~stopped).float())
+
+                X_ = X
+                X = (X * (~new_selection | stopped).float().unsqueeze(1).repeat(1, self.d) 
+                     + X_proposal * (new_selection & ~stopped).float().unsqueeze(1).repeat(1, self.d))
+
+                if pt.sum(~new_selection & ~stopped) > 0:
+                    stopped[~new_selection & ~stopped] += True
+
+                if self.loss_method == 'raissi':
+                    loss += self.alpha[0] * pt.mean((self.V(X).squeeze() - Y_.squeeze() + (self.problem.h(X_, Y_.squeeze(), Z)
+                                                                 - pt.sum(Z * c.t(), 1)) * self.delta_t 
+                                     - pt.sum(Z * xi, 1) * self.sq_delta_t)**2 * (new_selection & ~stopped).float())
+
+            if self.loss_method == 'ito':
+                loss += self.alpha[0] * pt.mean((self.V(X).squeeze() - phi_0 - Y)**2)
+            self.V.zero_grad()
+            #lambda_.zero_grad()
+
+            if self.loss_method == 'L4':
+                loss += pt.mean((Y - self.problem.g(X))**2)
+
+            if self.loss_with_stopped:
+                loss += self.alpha[0] * pt.mean((Y[stopped] - self.problem.g(X[stopped, :]))**2)
+            loss.backward(retain_graph=True)
+            self.V.optim.step()
+
+            #lambda_.optim.step()
+
+            self.loss_log.append(loss.item())
+            self.V_L2_log.append(pt.mean(V_L2).item())
+            if self.K_test_log is not None:
+                self.V_test_log.append(compute_test_error(self, self.problem, self.K_test_log, self.device))
+
+            t_1 = time.time()
+            self.times.append(t_1 - t_0)
+
+            if self.verbose:
+                if l % self.print_every == 0:
+                    print('%d - loss = %.4e, v L2 error = %.4e, n = %d, active: %d/%d, %.2f' % 
+                          (l, self.loss_log[-1], self.V_L2_log[-1], n, K_selection, self.K, np.mean(self.times[-self.print_every:])))
+
+    def train_PINN(self):
+        for l in range(self.L):
+
+            t_0 = time.time()
+
+            if self.problem.boundary == 'sphere':
+                X_boundary = pt.rand(self.K_boundary, self.problem.d).to(self.device) * 2 - 1
+                X_boundary = self.problem.boundary_distance * X_boundary / pt.sqrt(pt.sum(X_boundary**2, 1)).unsqueeze(1)
+            elif self.problem.boundary == 'two_spheres':
+                X_boundary = pt.rand(self.K_boundary, self.problem.d).to(self.device) * 2 - 1
+                X_boundary = (pt.tensor([self.problem.boundary_distance_1] * int(self.K_boundary / 2) + 
+                                        [self.problem.boundary_distance_2] * int(self.K_boundary / 2)).unsqueeze(1).to(self.device)
+                              * X_boundary / pt.sqrt(pt.sum(X_boundary**2, 1)).unsqueeze(1))
+            elif self.problem.boundary == 'square':
+                s = np.concatenate([np.ones(int(self.K_boundary / 2))[:, np.newaxis], np.zeros([int(self.K_boundary / 2), self.d - 1])], 1)
+                np.apply_along_axis(np.random.shuffle, 1, s)
+                a = np.concatenate([s, np.zeros([int(self.K_boundary / 2), self.problem.d])]).astype(bool)
+                b = np.concatenate([np.zeros([int(self.K_boundary / 2), self.problem.d]), s]).astype(bool)
+                X_boundary = (self.problem.X_r - self.problem.X_l) * pt.rand(self.K_boundary, self.problem.d).to(self.device) + self.problem.X_l
+                X_boundary[pt.tensor(a.astype(float)).byte()] = self.problem.X_l
+                X_boundary[pt.tensor(b.astype(float)).byte()] = self.problem.X_r
+                if self.problem.one_boundary:
+                    X_boundary[pt.tensor(a.astype(float)).byte()] = self.problem.X_r
+                    X_boundary[pt.tensor(b.astype(float)).byte()] = self.problem.X_r
+
+            if self.problem.boundary == 'sphere':
+                X = 2 * pt.rand(self.K, self.problem.d).to(self.device) - 1
+                X = self.problem.boundary_distance * X / pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) * (pt.rand(self.K).unsqueeze(1)).to(self.device)
+            elif self.problem.boundary == 'two_spheres':
+                X = pt.rand(self.K, self.problem.d).to(self.device) * 2 - 1
+                X = X / pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) * (pt.rand(self.K, self.problem.d).to(self.device) * (self.problem.boundary_distance_2 - self.problem.boundary_distance_1) + self.problem.boundary_distance_1)
+            elif self.problem.boundary == 'square':
+                X = (self.problem.X_r - self.problem.X_l) * pt.rand(self.K, self.problem.d).to(self.device) + self.problem.X_l
+
+            laplacian = pt.zeros(X.shape[0]).to(self.device)
+
+            X = pt.autograd.Variable(X, requires_grad=True)
+
+            #for i, x in enumerate(X):
+            #    #hess = hessian(self.V(x.unsqueeze(0)), x.unsqueeze(0)).squeeze()
+            #    hess = hessian(self.V, x.unsqueeze(0), create_graph=True) # pt.autograd.functional.
+            #    laplacian[i] = pt.diagonal(hess.view(d, d), offset=0).sum()
+
+            V_eval = self.V(X).squeeze()
+            grad = pt.autograd.grad(V_eval, X, grad_outputs=pt.ones(self.K).to(self.device), create_graph=True)[0]
+
+            for k in range(grad.shape[1]):
+                rad_grad_u_xx = pt.autograd.grad(grad[:, k], X, grad_outputs=pt.ones(self.K).to(self.device), create_graph=True)[0][:, k]
+                laplacian += rad_grad_u_xx
+
+            # works only for diagonal diffusion matrix with same entries
+            if self.PINN_log_variance:
+                loss = self.alpha[0] * pt.var(self.problem.B[0, 0]**2 * 0.5 * laplacian + pt.sum(self.problem.b(X) * grad, 1) 
+                                              + self.problem.h(X, self.V(X).squeeze(), pt.mm(self.problem.B, grad.t()).t()))
+            else:
+                loss = self.alpha[0] * pt.mean((self.problem.B[0, 0]**2 * 0.5 * laplacian + pt.sum(self.problem.b(X) * grad, 1) 
+                                                + self.problem.h(X, self.V(X).squeeze(), pt.mm(self.problem.B, grad.t()).t()))**2) 
+            if self.log_loss_parts:
+                self.loss_log_domain.append(loss.item() / self.alpha[0])
+            if self.boundary_loss:
+                loss += self.alpha[1] * pt.mean((self.V(X_boundary).squeeze() - self.problem.g(X_boundary))**2)
+            if self.log_loss_parts:
+                self.loss_log_boundary.append(pt.mean((self.V(X_boundary).squeeze() - self.problem.g(X_boundary))**2).item())
+
+            self.V.zero_grad()
+
+            loss.backward(retain_graph=True)
+            self.V.optim.step()
+
+            self.V_L2_log.append(pt.mean(((self.V(X).squeeze() - pt.tensor(self.problem.v_true(X.detach())).float().squeeze())**2).detach().cpu() * self.delta_t_np).item())
+            self.loss_log.append(loss.item())
+            if self.K_test_log is not None:
+                self.V_test_log.append(compute_test_error(self, self.problem, self.K_test_log, self.device))
+
+            t_1 = time.time()
+            self.times.append(t_1 - t_0)
+
+            if l % self.print_every == 0:
+                print('%d - loss = %.4e - v L2 error = %.4e - %.2f' % (l, self.loss_log[-1], self.V_L2_log[-1], np.mean(self.times[-self.print_every:])))
+
+
+
+
+
+class GeneralSolver():
+    
+    def __init__(self, problem, name, seed=42, delta_t=0.01, N=50, lr=0.001, L=100000, K=200, K_boundary=50,
+                 alpha=[1.0, 1.0, 1.0], adaptive_forward_process=False, detach_forward=True, print_every=100, verbose=True, 
+                 approx_method='Y', sample_center=False, loss_method='ito', loss_with_stopped=False, K_test_log=None,
+                 PINN_log_variance=False, log_loss_parts=False, boundary_loss=True):
+        self.problem = problem
+        self.name = name
+        self.date = date.today().strftime('%Y-%m-%d')
+        self.d = problem.d
+
+        # hyperparameters
+        self.device = pt.device('cpu')
+        self.seed = seed
+        self.delta_t_np = delta_t
+        self.delta_t = pt.tensor(self.delta_t_np).to(self.device) # step size
+        self.sq_delta_t = pt.sqrt(self.delta_t).to(self.device)
+        self.N = N
+        self.lr = lr # learning rate
+        self.L = L # gradient steps
+        self.K = K # batch size in domain
+        self.K_boundary = K_boundary # batch size on boundary
+        self.alpha = alpha
+
+        # learning properties
+        self.adaptive_forward_process = adaptive_forward_process
+        self.detach_forward = detach_forward
+        self.approx_method = approx_method
+        self.sample_center = sample_center
+        self.loss_method = loss_method
+        self.loss_with_stopped = loss_with_stopped
+        self.boundary_loss = boundary_loss
+        self.PINN_log_variance = PINN_log_variance
+
+        # printing and logging
+        self.print_every = print_every
+        self.verbose = verbose
+
+        # function approximation
+        pt.manual_seed(seed)
+        if self.approx_method == 'Y':
+            self.V = DenseNet(d_in=self.d + 1, d_out=1, lr=self.lr, seed=seed).to(self.device)
+        elif self.approx_method == 'Z':
+            self.y_0 = SingleParam(lr=self.lr).to(self.device)
+            self.Z = DenseNet(d_in=self.d + 1, d_out=self.d, lr=self.lr, seed=seed).to(self.device)
+            
+        # logging
+        self.K_test_log = K_test_log
+        self.Y_0_log = []
+        self.loss_log = []
+        self.loss_log_domain = []
+        self.loss_log_boundary = []
+        self.u_L2_log = []
+        self.V_L2_log = []
+        self.V_test_log = []
+        self.times = []
+        self.lambda_log = []
+        self.log_loss_parts = log_loss_parts
+        
+    def train(self):
+    
+        pt.manual_seed(self.seed)
+
+        if self.loss_method == 'PINN':
+            self.train_PINN()
+            return None
+        
+        for l in range(self.L):
+
+            t_0 = time.time()
+
+            loss = 0
+
+            if self.sample_center:
+                X_center = pt.zeros(1, 1)
+                loss += pt.mean((self.V(X_center).squeeze() - self.problem.v_true(X_center).squeeze())**2)
+
+            # sample uniformly on boundary
+            if self.problem.boundary == 'sphere':
+                X_boundary = pt.rand(self.K_boundary, self.d).to(self.device) * 2 - 1
+                X_boundary = self.problem.boundary_distance * X_boundary / pt.sqrt(pt.sum(X_boundary**2, 1)).unsqueeze(1)
+            elif self.problem.boundary == 'two_spheres':
+                X_boundary = pt.rand(self.K_boundary, self.problem.d).to(self.device) * 2 - 1
+                X_boundary = (pt.tensor([self.problem.boundary_distance_1] * int(self.K_boundary / 2) + 
+                                        [self.problem.boundary_distance_2] * int(self.K_boundary / 2)).unsqueeze(1).to(self.device)
+                              * X_boundary / pt.sqrt(pt.sum(X_boundary**2, 1)).unsqueeze(1))
+            elif self.problem.boundary == 'square':
+                s = np.concatenate([np.ones(int(self.K_boundary / 2))[:, np.newaxis], np.zeros([int(self.K_boundary / 2), self.d - 1])], 1)
+                np.apply_along_axis(np.random.shuffle, 1, s)
+                a = np.concatenate([s, np.zeros([int(self.K_boundary / 2), self.problem.d])]).astype(bool)
+                b = np.concatenate([np.zeros([int(self.K_boundary / 2), self.problem.d]), s]).astype(bool)
+                X_boundary = (self.problem.X_r - self.problem.X_l) * pt.rand(self.K_boundary, self.problem.d).to(self.device) + self.problem.X_l
+                X_boundary[pt.tensor(a.astype(float)).byte()] = self.problem.X_l
+                X_boundary[pt.tensor(b.astype(float)).byte()] = self.problem.X_r
+                if self.problem.one_boundary:
+                    X_boundary[pt.tensor(a.astype(float)).byte()] = self.problem.X_r
+                    X_boundary[pt.tensor(b.astype(float)).byte()] = self.problem.X_r
+
+            if self.problem.boundary in ['sphere', 'unbounded']:
+                X = 2 * pt.rand(self.K, self.problem.d).to(self.device) - 1
+                X = self.problem.boundary_distance * X / pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) * (pt.rand(self.K).unsqueeze(1)).to(self.device)
+            elif self.problem.boundary == 'two_spheres':
+                X = pt.rand(self.K, self.problem.d).to(self.device) * 2 - 1
+                X = X / pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) * (pt.rand(self.K, self.problem.d).to(self.device) * (self.problem.boundary_distance_2 - self.problem.boundary_distance_1) + self.problem.boundary_distance_1)
+            elif self.problem.boundary == 'square':
+                X = (self.problem.X_r - self.problem.X_l) * pt.rand(self.K, self.problem.d).to(self.device) + self.problem.X_l
+
+            if self.problem.boundary != 'unbounded':
+                t_n_boundary = pt.rand(self.K_boundary, 1) * self.problem.T
+                X_t_n_boundary = pt.cat([X_boundary, t_n_boundary], 1)
+
+            if self.loss_method != 'L4' and self.boundary_loss:
+                #loss += self.alpha[1] * pt.mean((self.V(X_boundary).squeeze() - self.problem.g(X_boundary))**2)
+                X_T = pt.cat([X[:self.K_boundary, :], self.problem.T * pt.ones(self.K_boundary).unsqueeze(1)], 1)
+                loss += self.alpha[1] * pt.mean((self.V(X_T).squeeze() - self.problem.f(X[:self.K_boundary, :]))**2)
+                if self.problem.boundary != 'unbounded':
+                    loss += self.alpha[2] * pt.mean((self.V(X_t_n_boundary).squeeze() - self.problem.g(X_boundary, t_n_boundary.squeeze()))**2)
+
+
+            X = pt.autograd.Variable(X, requires_grad=True)
+            Y = pt.zeros(self.K).to(self.device)
+            t_n = pt.rand(self.K, 1) * self.problem.T
+            X_t_n = pt.cat([X, t_n], 1)
+            if self.loss_method in ['jentzen', 'L4']:
+                Y = self.V(X_t_n).squeeze()
+
+            #lambda_log.append(lambda_(X)[0].item())
+            stopped = pt.zeros(self.K).byte().to(self.device)
+            hitting_times = pt.zeros(self.K)
+            V_L2 = pt.zeros(self.K)
+
+            phi_0 = self.V(X_t_n).squeeze()
+
+            for n in range(self.N):
+
+                Y_ = self.V(X_t_n)
+                Y_eval = Y_.squeeze().sum() # compare to Jacobi-Vector trick
+                Y_eval.backward(retain_graph=True) # do we need this?
+                Z, = pt.autograd.grad(Y_eval, X, create_graph=True) # , allow_unused=True
+                Z = pt.mm(self.problem.sigma(X).t(), Z.t()).t()
+
+                xi = pt.randn(self.K, self.d).to(self.device)
+
+                selection = ~stopped
+                K_selection = pt.sum(selection)
+                if K_selection == 0:
+                    break
+
+                #V_L2[selection] += ((self.V(X_t_n[selection]).squeeze() - pt.tensor(self.problem.v_true(X[selection], t_n[selection])).float().squeeze())**2).detach().cpu() * self.delta_t_np
+
+                c = pt.zeros(self.d, self.K).to(self.device)
+                if self.adaptive_forward_process is True:
+                    c = -Z.t()
+                if self.detach_forward is True:
+                    c = c.detach()
+
+                X_proposal = (X + ((self.problem.b(X) + pt.mm(self.problem.sigma(X), c).t()) * self.delta_t
+                     + pt.mm(self.problem.sigma(X), xi.t()).t() * self.sq_delta_t) * selection.float().unsqueeze(1).repeat(1, self.d))
+
+                new_selection = pt.ones(self.K).byte()
+                hitting_times[selection] += 1
+                if self.problem.boundary == 'sphere':
+                    new_selection = pt.all(pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) < self.problem.boundary_distance, 1).to(self.device)
+                elif self.problem.boundary == 'two_spheres':
+                    new_selection = ((pt.sqrt(pt.sum(X**2, 1)) > self.problem.boundary_distance_1) & (pt.sqrt(pt.sum(X**2, 1)) < self.problem.boundary_distance_2)).to(self.device)
+                elif self.problem.boundary == 'square':
+                    if self.problem.one_boundary:
+                        new_selection = pt.all((X_proposal <= self.problem.X_r), 1).to(self.device)
+                    else:
+                        new_selection = pt.all((X_proposal >= self.problem.X_l) & (X_proposal <= self.problem.X_r), 1).to(self.device)
+
+                new_selection = new_selection & ((t_n.squeeze() + self.delta_t) <= self.problem.T)
+
+                if self.loss_method == 'jentzen':
+                    loss += self.alpha[0] * pt.mean((Y_.squeeze() - Y)**2 * (new_selection & ~stopped).float())
+
+                if self.loss_method in ['jentzen', 'L4']:
+                    Y = (Y + ((- self.problem.h(n * self.delta_t, X, Y, Z) #- lambda_(X) * Y_.squeeze() #  lambda_(X) 
+                               + pt.sum(Z * c.t(), 1)) * self.delta_t + pt.sum(Z * xi, 1) * self.sq_delta_t) * (new_selection & ~stopped).float())
+                else:
+                    Y = (Y + ((- self.problem.h(n * self.delta_t, X, Y_.squeeze(), Z) #- lambda_(X) * Y_.squeeze() #  lambda_(X) 
+                               + pt.sum(Z * c.t(), 1)) * self.delta_t + pt.sum(Z * xi, 1) * self.sq_delta_t) * (new_selection & ~stopped).float())
+
+                X_ = X
+                X = (X * (~new_selection | stopped).float().unsqueeze(1).repeat(1, self.d) 
+                     + X_proposal * (new_selection & ~stopped).float().unsqueeze(1).repeat(1, self.d))
+
+                t_n += self.delta_t * (new_selection & ~stopped).float().unsqueeze(1)
+                X_t_n = pt.cat([X, t_n], 1)
+
+                if pt.sum(~new_selection & ~stopped) > 0:
+                    stopped[~new_selection & ~stopped] += True
+
+                if self.loss_method == 'raissi':
+                    loss += self.alpha[0] * pt.mean((self.V(X).squeeze() - Y_.squeeze() + (self.problem.h(X_, Y_.squeeze(), Z)
+                                                                 - pt.sum(Z * c.t(), 1)) * self.delta_t 
+                                     - pt.sum(Z * xi, 1) * self.sq_delta_t)**2 * (new_selection & ~stopped).float())
+
+            if self.loss_method == 'ito':
+                loss += self.alpha[0] * pt.mean((self.V(X_t_n).squeeze() - phi_0 - Y)**2)
+            self.V.zero_grad()
+            #lambda_.zero_grad()
+
+            if self.loss_method == 'L4':
+                loss += pt.mean((Y - self.problem.g(X))**2)
+
+            if self.loss_with_stopped:
+                loss += self.alpha[0] * pt.mean((Y[stopped] - self.problem.g(X[stopped, :]))**2)
+            loss.backward(retain_graph=True)
+            self.V.optim.step()
+
+            #lambda_.optim.step()
+
+            self.loss_log.append(loss.item())
+            self.V_L2_log.append(pt.mean(V_L2).item())
+            if self.K_test_log is not None:
+                self.V_test_log.append(compute_test_error(self, self.problem, self.K_test_log, self.device, 'parabolic'))
+
+            t_1 = time.time()
+            self.times.append(t_1 - t_0)
+
+            if self.verbose:
+                if l % self.print_every == 0:
+                    print('%d - loss = %.4e, v L2 error = %.4e, n = %d, active: %d/%d, %.2f' % 
+                          (l, self.loss_log[-1], self.V_L2_log[-1], n, K_selection, self.K, np.mean(self.times[-self.print_every:])))
+
