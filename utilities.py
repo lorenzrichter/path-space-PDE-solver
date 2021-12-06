@@ -46,12 +46,71 @@ def plot_loss_logs(experiment_name, models):
     return fig
 
 
+def plot_loss_logs_extended(experiment_name, models):
+    fig, ax = plt.subplots(1, 4, figsize=(15, 3.5))
+
+    fig.suptitle(r'%s, $d = %d$' % (experiment_name, models[0].problem.d))
+
+    for model in models:
+        ax[0].plot(model.loss_log, label=model.name)
+        ax[0].set_yscale('log');
+        ax[0].legend()
+        ax[1].plot(model.V_L2_log)
+        ax[1].set_xlabel('iterations')
+        ax[1].set_yscale('log');
+        #if model.loss_method == 'PINN':
+        #    ax[2].plot(np.linspace(1, len(model.V_L2_log) * model.K, len(model.V_L2_log)), model.V_L2_log)
+        #else:
+        #    ax[2].plot(np.linspace(1, len(model.V_L2_log) * model.N * model.K, len(model.V_L2_log)), model.V_L2_log)
+        #ax[2].set_yscale('log');
+        #ax[2].set_xlabel('samples')
+        ax[2].plot(model.V_test_rel_abs)
+        ax[2].set_xlabel('iterations')
+        ax[2].set_yscale('log');
+
+        ax[3].plot(model.V_test_L2)
+        ax[3].set_xlabel('iterations')
+        ax[3].set_yscale('log');
+    ax[0].set_title('loss')
+    ax[1].set_title(r'$L^2$ error $V$');
+    ax[2].set_title(r'relative absolute test error')
+    ax[3].set_title(r'$L^2$ test error')
+
+    fig.tight_layout(rect=[0, 0.03, 1, 0.93])
+
+    return fig
+
+
+def plot_moving_average(experiment_name, models, moving_span=400):
+    fig, ax = plt.subplots(1, 3, figsize=(15, 3.5))
+
+    ax[0].set_title('test error')
+    for model in models:
+        ax[0].plot(model.V_test_L2, label=model.name)
+    ax[0].set_yscale('log')
+    ax[0].legend()
+
+    ax[1].set_title('moving average relative absolute test error')
+    for model in models:
+        ax[1].plot([np.mean(model.V_test_rel_abs[i:i + moving_span]) for i in range(len(model.V_test_rel_abs) - moving_span)], label=model.name)
+    ax[1].set_yscale('log')
+    ax[1].legend()
+
+    ax[2].set_title(r'moving average $L^2$ test error')
+    for model in models:
+        ax[2].plot([np.mean(model.V_test_L2[i:i + moving_span]) for i in range(len(model.V_test_L2) - moving_span)], label=model.name)
+    ax[2].set_yscale('log')
+    ax[2].legend()
+
+    return fig
+
+
 def plot_solution(model, x, t, components, ylims=None):
     if len(components) > 10:
         print('You can display at most 10 components.')
         return None
     n = int(np.ceil(t / model.delta_t_np))
-    t_range = np.linspace(0, model.T, model.N)
+    t_range = np.linspace(0, model.problem.T, model.N)
     x_val = pt.linspace(-3, 3, 100)
 
     if model.approx_method == 'control':
@@ -231,7 +290,7 @@ def do_importance_sampling_me(problem, model, K, control='approx', simulate_naiv
     Memory efficient importance sampling, do not keep whole trajectories.
     '''
     if on_cpu:
-        device = pt.device('cpu')
+        device = pt.device('cuda')
         model.z_n = model.z_n.to(device)
     else:
         device = model.device
@@ -378,6 +437,41 @@ def plot_path_ensemble(problem, model, K, fig_file_name_prefix, control='zero', 
     plt.savefig(fig_file_name)
 
 
+def compute_test_error(model, problem, K, device=pt.device('cuda'), modus='elliptic'):
+    if problem.boundary in ['sphere', 'unbounded']:
+        #X = pt.rand(K, problem.d).to(device) * 2 - 1
+        #X = problem.boundary_distance * X / pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) * (pt.rand(K).unsqueeze(1)).to(device)
+        X = pt.randn(K, problem.d).to(device)
+        X = problem.boundary_distance * X / pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) * (pt.rand(K).unsqueeze(1)**(1 / problem.d)).to(device)
+    elif problem.boundary == 'two_spheres':
+        X = pt.randn(K, problem.d).to(device)
+        X = problem.boundary_distance_2 * X / pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) * (pt.rand(K).unsqueeze(1)**(1 / problem.d)).to(device)
+        selection = pt.sqrt(pt.sum(X**2, 1)) > problem.boundary_distance_1
+        X = X[selection, :]
+        #X = pt.rand(self.K, self.problem.d).to(self.device) * 2 - 1
+        #X = X / pt.sqrt(pt.sum(X**2, 1)).unsqueeze(1) * (pt.rand(self.K, self.problem.d).to(self.device) * (self.problem.boundary_distance_2 - self.problem.boundary_distance_1) + self.problem.boundary_distance_1)
+    elif problem.boundary in ['square', 'unbounded_square']:
+        X = (problem.X_r - problem.X_l) * pt.rand(K, problem.d).to(device) + problem.X_l
+
+    if modus == 'parabolic':
+        t_n = pt.rand(K, 1).to(device) * problem.T
+        X_t_n = pt.cat([X, t_n], 1)        
+        v_true = np.array(problem.v_true(X.detach().cpu(), t_n.cpu().squeeze()).squeeze())
+        v_est = model.V(X_t_n).squeeze().detach().cpu().numpy()
+        L2_error = np.mean((v_true - v_est)**2)
+        relative_L2_error = np.mean(((v_true - v_est) / (1 + np.abs(v_true)))**2)
+        mean_abolute_error = np.mean(np.abs(v_true - v_est))
+        mean_relative_error = np.mean(np.abs(v_true - v_est) / v_true)
+    else:
+        v_true = np.array(problem.v_true(X.detach().cpu()).squeeze())
+        v_est = model.V(X).squeeze().detach().cpu().numpy()
+        L2_error = np.mean((v_true - v_est)**2)
+        relative_L2_error = np.mean(((v_true - v_est) / (1 + np.abs(v_true)))**2)
+        mean_abolute_error = np.mean(np.abs(v_true - v_est))
+        mean_relative_error = np.mean(np.abs(v_true - v_est) / v_true)
+    return L2_error, mean_abolute_error, mean_relative_error # relative_L2_error
+
+
 def save_exp_logs(models, name):
     exp_log = {}
     for model in models:
@@ -388,6 +482,7 @@ def save_exp_logs(models, name):
     filename = '%s_%s.json' % (name, date.today().strftime('%Y-%m-%d'))
     with open('logs/%s' % filename, 'w') as f:
         json.dump(exp_log, f)
+
 
 def load_exp_logs(filename):
     with open('logs/%s' % filename, 'r') as f:
